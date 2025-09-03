@@ -1,55 +1,42 @@
-// Eletechsup ES32D26 relays via 74HC595 + ULN2803A
-// Mapping (from user continuity):
-// SER/DATA -> GPIO12
-// SRCLK    -> GPIO22
-// RCLK     -> GPIO23 (latch)
-// OE       -> GPIO13 (active LOW)
-// MR       -> tied HIGH (not controlled)
+// Serial-only Vi1..Vi4 publisher (mV) for ES32D26 — labeled output only
+#include <Arduino.h>
+#include <WiFi.h>
 
-const int PIN_DATA  = 12;
-const int PIN_CLK   = 22;
-const int PIN_LATCH = 23;
-const int PIN_OE    = 13;  // active LOW
+// Final mapping:
+// Vi1 -> GPIO14 (ADC2)
+// Vi2 -> GPIO33 (ADC1)
+// Vi3 -> GPIO27 (ADC2)
+// Vi4 -> GPIO32 (ADC1)
+const int VI1_PIN = 14; // ADC2
+const int VI2_PIN = 33; // ADC1
+const int VI3_PIN = 27; // ADC2
+const int VI4_PIN = 32; // ADC1
 
-inline void srLatch() {
-  digitalWrite(PIN_LATCH, LOW);
-  digitalWrite(PIN_LATCH, HIGH);
+static int readAvgMilliVolts(int pin, int samples=8){
+  long acc=0; for(int i=0;i<samples;i++){ acc += analogReadMilliVolts(pin); delay(2);} return (int)(acc/samples);
 }
 
-inline void srWrite(uint8_t value) {
-  // Shift out LSB-first; channel order may vary but all 8 will toggle
-  for (int i = 0; i < 8; ++i) {
-    digitalWrite(PIN_CLK, LOW);
-    digitalWrite(PIN_DATA, (value >> i) & 0x01);
-    digitalWrite(PIN_CLK, HIGH);
-  }
-  srLatch();
+void setup(){
+  Serial.begin(115200);
+  delay(150);
+  // Ensure radio is off so ADC2 reads are reliable
+  WiFi.mode(WIFI_OFF);
+  analogReadResolution(12);
+  analogSetPinAttenuation(VI1_PIN, ADC_11db);
+  analogSetPinAttenuation(VI2_PIN, ADC_11db);
+  analogSetPinAttenuation(VI3_PIN, ADC_11db);
+  analogSetPinAttenuation(VI4_PIN, ADC_11db);
 }
 
-void setup() {
-  pinMode(PIN_DATA, OUTPUT);
-  pinMode(PIN_CLK, OUTPUT);
-  pinMode(PIN_LATCH, OUTPUT);
-  pinMode(PIN_OE, OUTPUT);
+void loop(){
+  int vi1 = readAvgMilliVolts(VI1_PIN, 8);
+  int vi2 = readAvgMilliVolts(VI2_PIN, 8);
+  int vi3 = readAvgMilliVolts(VI3_PIN, 8);
+  int vi4 = readAvgMilliVolts(VI4_PIN, 8);
 
-  digitalWrite(PIN_DATA, LOW);
-  digitalWrite(PIN_CLK, LOW);
-  digitalWrite(PIN_LATCH, HIGH);
-
-  // Enable outputs (active LOW)
-  digitalWrite(PIN_OE, LOW);
-
-  // All relays OFF initially (ULN2803 sinks when input is HIGH)
-  srWrite(0x00);
-}
-
-void loop() {
-  // Turn each relay ON for 1s, then OFF
-  for (int r = 0; r < 8; ++r) {
-    uint8_t onVal = (1 << r);  // active-HIGH into ULN2803 -> relay ON
-    srWrite(onVal);
-    delay(1000);
-    srWrite(0x00);
-    delay(400);
-  }
+  Serial.print("Vi1: "); Serial.print(vi1); Serial.println(" mV");
+  Serial.print("Vi2: "); Serial.print(vi2); Serial.println(" mV");
+  Serial.print("Vi3: "); Serial.print(vi3); Serial.println(" mV");
+  Serial.print("Vi4: "); Serial.print(vi4); Serial.println(" mV\n");
+  delay(2000);
 }
