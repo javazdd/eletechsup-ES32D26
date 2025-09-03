@@ -1,0 +1,78 @@
+// 74HC595 finder: fixed DATA=13, CLK=14; scan LATCH and OE (active-high/low)
+#include <Arduino.h>
+
+const int PIN_DATA = 13;
+const int PIN_CLK  = 14;
+const int latchCandidates[] = { 5, 2, 4, 25, 26, 27, 32, 33, 15, 18, 23 };
+const int oeCandidates[]    = { 0, 2, 4, 5, 12, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33 };
+
+void shiftOutBits(int pinLatch, uint8_t value) {
+  for (int i = 7; i >= 0; --i) {
+    digitalWrite(PIN_CLK, LOW);
+    digitalWrite(PIN_DATA, (value >> i) & 0x01);
+    digitalWrite(PIN_CLK, HIGH);
+  }
+  digitalWrite(pinLatch, LOW);
+  digitalWrite(pinLatch, HIGH);
+}
+
+void testCombo(int pinLatch, int pinOE, bool oeActiveLow, bool dataActiveHigh) {
+  pinMode(PIN_DATA, OUTPUT);
+  pinMode(PIN_CLK, OUTPUT);
+  pinMode(pinLatch, OUTPUT);
+  pinMode(pinOE, OUTPUT);
+
+  digitalWrite(PIN_DATA, LOW);
+  digitalWrite(PIN_CLK, LOW);
+  digitalWrite(pinLatch, HIGH);
+
+  // Enable outputs
+  digitalWrite(pinOE, oeActiveLow ? LOW : HIGH);
+
+  Serial.print("LATCH="); Serial.print(pinLatch);
+  Serial.print(" OE="); Serial.print(pinOE);
+  Serial.print(oeActiveLow ? " (OE low=EN)" : " (OE high=EN)");
+  Serial.print(" DATA "); Serial.println(dataActiveHigh ? "HIGH=1" : "LOW=1");
+
+  uint8_t base = dataActiveHigh ? 0x00 : 0xFF;
+  shiftOutBits(pinLatch, base);
+  delay(250);
+
+  for (int bit = 0; bit < 8; ++bit) {
+    uint8_t mask = (1 << bit);
+    uint8_t onVal  = dataActiveHigh ? (base | mask) : (base & ~mask);
+    uint8_t offVal = base;
+    shiftOutBits(pinLatch, onVal);
+    delay(600);
+    shiftOutBits(pinLatch, offVal);
+    delay(250);
+  }
+
+  // Disable outputs
+  digitalWrite(pinOE, oeActiveLow ? HIGH : LOW);
+  pinMode(pinLatch, INPUT);
+  pinMode(pinOE, INPUT);
+}
+
+void setup(){
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("Scanning LATCH and OE...");
+}
+
+void loop(){
+  for (int li = 0; li < (int)(sizeof(latchCandidates)/sizeof(latchCandidates[0])); ++li) {
+    for (int oi = 0; oi < (int)(sizeof(oeCandidates)/sizeof(oeCandidates[0])); ++oi) {
+      int latch = latchCandidates[li];
+      int oe = oeCandidates[oi];
+      if (oe == latch || oe == PIN_DATA || oe == PIN_CLK) continue;
+      testCombo(latch, oe, true,  true);
+      testCombo(latch, oe, true,  false);
+      testCombo(latch, oe, false, true);
+      testCombo(latch, oe, false, false);
+      delay(300);
+    }
+  }
+  Serial.println("OE/LATCH scan done. Restarting in 3s...\n");
+  delay(3000);
+}
