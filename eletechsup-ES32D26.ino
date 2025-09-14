@@ -13,18 +13,18 @@
 #include <HTTPClient.h>
 
 // ------------ Network (static IP) ------------
-const char* WIFI_SSID = "<YOUR_WIFI_SSID>";
-const char* WIFI_PASS = "<YOUR_WIFI_PASSWORD>";
-IPAddress STATIC_IP(0,0,0,0);
-IPAddress GATEWAY(0,0,0,0);
-IPAddress SUBNET(0,0,0,0);
-IPAddress DNS1(0,0,0,0);
+const char* WIFI_SSID = "PrediccioNet";
+const char* WIFI_PASS = "emulsify.impearl.tress";
+IPAddress STATIC_IP(192,168,88,206);
+IPAddress GATEWAY(192,168,88,1);
+IPAddress SUBNET(255,255,255,0);
+IPAddress DNS1(8,8,8,8);
 
 // ------------ MQTT ------------
-const char* MQTT_HOST = "<MQTT_HOST>";
+const char* MQTT_HOST = "192.168.88.205";
 const uint16_t MQTT_PORT = 1883;
-const char* MQTT_USER = "<MQTT_USER>";
-const char* MQTT_PASS = "<MQTT_PASS>";
+const char* MQTT_USER = "eletechsup";
+const char* MQTT_PASS = "ngv1udw0YBZ!ygk.tru";
 
 // Topics (subscribe to both with and without leading slash for safety)
 const char* topics_slash[] = {
@@ -33,14 +33,14 @@ const char* topics_slash[] = {
 const char* topics[] = {
   "eletechsup/prefilter","eletechsup/postfilter","eletechsup/500","eletechsup/250","eletechsup/100","eletechsup/50"
 };
-// Input publish base topic (each input publishes its terminal voltage here)
+// Base topic to publish input terminal voltages
 const char* INPUT_BASE_TOPIC = "/eletechsup/inputs";
 // channel index map (0-based relay number)
 // ch1=prefilter, ch2=postfilter, ch3=500, ch4=250, ch5=100, ch6=50
 
 // ------------ DogStatsD ------------
 // DogStatsD disabled; using HTTPS metrics intake instead
-const char* DD_HOST = "<AGENT_HOSTNAME_OR_IP>"; // retained for compatibility (unused)
+IPAddress DD_HOST(192,168,88,205); // retained for compatibility (unused)
 const uint16_t DD_PORT = 8125;     // unused
 WiFiUDP ddUdp;                     // unused
 
@@ -71,7 +71,9 @@ const int SR_DATA  = 12;
 const int SR_CLK   = 22;
 const int SR_LATCH = 23;
 const int SR_OE    = 13; // active LOW
-uint8_t srState = 0x00; // bits 0..7 => ch1..ch8 (1 = ON)
+uint8_t srState = 0x00; // bits 0..7 => outputs
+// Map logical channels 1..6 to physical bit indices 2..7 (hardware wiring offset)
+static const uint8_t RELAY_BIT_FOR_CHANNEL[6] = {2,3,4,5,6,7};
 
 inline void srLatch(){ digitalWrite(SR_LATCH, LOW); digitalWrite(SR_LATCH, HIGH); }
 inline void srWrite(uint8_t value){
@@ -84,7 +86,14 @@ inline void srWrite(uint8_t value){
 }
 void setRelay(int ch, bool on){ // ch:1..8
   uint8_t before = srState;
-  if(on) srState |=  (1 << (ch-1)); else srState &= ~(1 << (ch-1));
+  if(ch>=1 && ch<=6){
+    uint8_t bit = RELAY_BIT_FOR_CHANNEL[ch-1];
+    if(on) srState |=  (1 << bit); else srState &= ~(1 << bit);
+  } else if(ch>=7 && ch<=8){
+    // pass-through for 7..8
+    uint8_t bit = (uint8_t)(ch-1);
+    if(on) srState |=  (1 << bit); else srState &= ~(1 << bit);
+  }
   if(srState != before){ srWrite(srState); }
 }
 
@@ -97,14 +106,19 @@ unsigned long timerStartMs = 0; // 0 means not started
 
 static int readAvgMilliVolts(int pin, int samples=8){ long acc=0; for(int i=0;i<samples;i++){ acc += analogReadMilliVolts(pin); delay(2);} return (int)(acc/samples); }
 
-int readADC2MilliVolts(int pin){
+// Batch-read ADC2 inputs (Vi1, Vi3) during a single WiFi-off window
+static void readADC2Pair(){
+  // Turn WiFi off once
   WiFi.disconnect(true,true); WiFi.mode(WIFI_OFF); delay(120);
-  int mv = readAvgMilliVolts(pin, 8);
+  // Read ADC2 channels
+  vi_mV[0] = readAvgMilliVolts(VI1_PIN, 8);
+  vi_mV[2] = readAvgMilliVolts(VI3_PIN, 8);
+  // Reconnect WiFi once
   WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
-  unsigned long t=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t<6000){ delay(80);} digitalWrite(LED_WIFI, WiFi.isConnected()?HIGH:LOW);
-  // re-bind UDP socket after radio cycle
+  unsigned long t=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t<8000){ delay(80);} 
+  digitalWrite(LED_WIFI, WiFi.isConnected()?HIGH:LOW);
+  // Re-bind UDP socket after radio cycle
   ddUdp.stop(); ddUdp.begin(0);
-  return mv;
 }
 
 void ensureWiFi(){
@@ -213,6 +227,18 @@ static void ddMetricGaugePsiDog(const char* channelTag, const char* locationTag,
   }
 }
 
+// DogStatsD gauge emitters for iot.voltage (terminal volts)
+static void ddMetricGaugeVoltsDog(const char* channelTag, const char* locationTag, float volts){
+  char buf[256];
+  if(locationTag && *locationTag){
+    int n = snprintf(buf, sizeof(buf), "iot.voltage:%0.3f|g|#%s,channel:%s,location:%s,unit:v\n", volts, DD_COMMON_TAGS, channelTag, locationTag);
+    ddUdp.beginPacket(DD_HOST, DD_PORT); ddUdp.write((uint8_t*)buf, n); ddUdp.endPacket();
+  } else {
+    int n = snprintf(buf, sizeof(buf), "iot.voltage:%0.3f|g|#%s,channel:%s,unit:v\n", volts, DD_COMMON_TAGS, channelTag);
+    ddUdp.beginPacket(DD_HOST, DD_PORT); ddUdp.write((uint8_t*)buf, n); ddUdp.endPacket();
+  }
+}
+
 void ensureMqtt(){
   if(mqtt.connected()) return;
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
@@ -252,13 +278,20 @@ static float mvToPsi(int mv, int idx){
 }
 
 void sampleAndPublish(){
-  // ADC1 with WiFi
+  // Read ADC1 while WiFi is up
   vi_mV[1] = readAvgMilliVolts(VI2_PIN, 8);
   vi_mV[3] = readAvgMilliVolts(VI4_PIN, 8);
-  // ADC2 windows
-  vi_mV[0] = readADC2MilliVolts(VI1_PIN);
-  vi_mV[2] = readADC2MilliVolts(VI3_PIN);
-  // MQTT publish: terminal voltages per channel (retained latest)
+  // Read ADC2 in a single WiFi-off window, then reconnect once
+  readADC2Pair();
+  // Allow connection to settle and ensure MQTT is connected before publishing
+  unsigned long settleStart = millis();
+  while(millis() - settleStart < 1200){
+    ensureMqtt();
+    mqtt.loop();
+    delay(50);
+  }
+
+  // Publish terminal voltages per input to MQTT (retained)
   if(mqtt.connected()){
     auto publishVolts = [&](const char* chan, int mv){
       float adcVolts = mv / 1000.0f;
@@ -273,13 +306,25 @@ void sampleAndPublish(){
     publishVolts("vi3", vi_mV[2]);
     publishVolts("vi4", vi_mV[3]);
   }
-  // Metrics via DogStatsD (UDP)
+
+  // Metrics via DogStatsD (UDP): pressure and voltage
+  float v1 = (vi_mV[0] / 1000.0f) * ADC_TO_TERMINAL_GAIN;
+  float v2 = (vi_mV[1] / 1000.0f) * ADC_TO_TERMINAL_GAIN;
+  float v3 = (vi_mV[2] / 1000.0f) * ADC_TO_TERMINAL_GAIN;
+  float v4 = (vi_mV[3] / 1000.0f) * ADC_TO_TERMINAL_GAIN;
+
   ddMetricGaugePsiDog("vi1", "tank",      mvToPsi(vi_mV[0],0));
   ddMetricGaugePsiDog("vi2", "house",     mvToPsi(vi_mV[1],1));
   ddMetricGaugePsiDog("vi3", "prefilter", mvToPsi(vi_mV[2],2));
-  float psi4 = mvToPsi(vi_mV[3],3);
-  ddMetricGaugePsiDog("vi4", "postfilter", psi4);
-  Serial.printf("PSI vi1:%0.2f vi2:%0.2f vi3:%0.2f vi4:%0.2f\n", mvToPsi(vi_mV[0],0), mvToPsi(vi_mV[1],1), mvToPsi(vi_mV[2],2), mvToPsi(vi_mV[3],3));
+  ddMetricGaugePsiDog("vi4", "postfilter", mvToPsi(vi_mV[3],3));
+
+  ddMetricGaugeVoltsDog("vi1", "tank",      v1);
+  ddMetricGaugeVoltsDog("vi2", "house",     v2);
+  ddMetricGaugeVoltsDog("vi3", "prefilter", v3);
+  ddMetricGaugeVoltsDog("vi4", "postfilter", v4);
+
+  Serial.printf("PSI vi1:%0.2f vi2:%0.2f vi3:%0.2f vi4:%0.2f | V vi1:%0.3f vi2:%0.3f vi3:%0.3f vi4:%0.3f\n",
+    mvToPsi(vi_mV[0],0), mvToPsi(vi_mV[1],1), mvToPsi(vi_mV[2],2), mvToPsi(vi_mV[3],3), v1, v2, v3, v4);
 }
 
 void setup(){
