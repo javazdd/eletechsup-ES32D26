@@ -1,42 +1,57 @@
-# Eletechsup ES32D26 Relay Test (ESP32)
+# eletechsup-ES32D26 (ESP32 firmware)
 
-This project loads an ESP32-DevKitC on the Eletechsup 2AO-8AI-8DI-8DO board and pulses all 8 relays one-by-one for 1s to verify hardware.
+Firmware for the Eletechsup 2AO-8AI-8DI-8DO board (ES32D26) using an ESP32-DevKitC.
 
-## Confirmed relay drive path
-- Relays are driven through a 74HC595 shift register into a ULN2803A driver array.
-- The shift register pins map to the ESP32 as follows:
-  - SER / DATA (74HC595 pin 14)  -> ESP32 GPIO12
-  - SRCLK / SHIFT CLK (pin 11)   -> ESP32 GPIO22
-  - RCLK / LATCH (pin 12)        -> ESP32 GPIO23
-  - OE (pin 13, active LOW)      -> ESP32 GPIO13 (held LOW to enable outputs)
-  - MR (pin 10, active LOW)      -> tied HIGH on board (not controlled by firmware)
+## What it does
+- Connects to Wi‑Fi and MQTT
+- Subscribes to topics and energizes/de‑energizes relays based on MQTT payloads
+- Samples 4 pressure transducers (Vi1..Vi4) every 15s
+- Publishes `iot.pressure` as DogStatsD metrics to a Datadog Agent with rich tags
+- Auto safety: after 300s from first MQTT command, turns all relays OFF
 
-Notes:
-- Bit order is LSB-first in firmware. Physical relay order may differ from bit order; this sketch just proves each channel actuates.
-- DIP SW1 must enable digital outputs (Io1=ON, Io2=ON, Vo1=OFF, Vo2=OFF). Board must be powered with 12V (or 24V as supported) for relays to actuate. USB alone is not enough.
+## Channels and relay mapping
+- Relays are driven via 74HC595 -> ULN2803A
+- Shift register pins to ESP32: DATA=GPIO12, SRCLK=GPIO22, LATCH=GPIO23, OE(LOW)=GPIO13
+- Channel tags and topics:
+  - ch1 → `prefilter`   → topic `/eletechsup/prefilter`
+  - ch2 → `postfilter`  → topic `/eletechsup/postfilter`
+  - ch3 → `500`         → topic `/eletechsup/500`
+  - ch4 → `250`         → topic `/eletechsup/250`
+  - ch5 → `100`         → topic `/eletechsup/100`
+  - ch6 → `50`          → topic `/eletechsup/50`
 
-## Firmware behavior
-- Each relay turns ON for 1 second, then OFF, sweeping through 8 relays repeatedly.
-- Implementation sends bits to the 74HC595, then latches with RCLK.
+## MQTT control
+- Host: `<MQTT_HOST>` (e.g., 192.168.88.205)
+- Port: `<MQTT_PORT>` (e.g., 1883)
+- User: `<MQTT_USER>`
+- Pass: `<MQTT_PASS>`
+- QoS: 1 | Retained: yes | Payloads: `1` (ON), `0` (OFF)
 
-## Build and upload (Arduino CLI)
-Prereqs:
-- Homebrew installed
-- Arduino CLI installed: `brew install arduino-cli`
-- ESP32 core installed once: `arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
-  and `arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
-
-Commands:
+Examples (mosquitto_pub):
 ```bash
-cd ~/esp32-relay-test
+HOST=<MQTT_HOST>; PORT=<MQTT_PORT>; USER="<MQTT_USER>"; PASS="<MQTT_PASS>"
+# ON
+for T in prefilter postfilter 500 250 100 50; do mosquitto_pub -h "$HOST" -p "$PORT" -u "$USER" -P "$PASS" -t "/eletechsup/$T" -m '1' -q 1 -r; done
+# OFF
+for T in prefilter postfilter 500 250 100 50; do mosquitto_pub -h "$HOST" -p "$PORT" -u "$USER" -P "$PASS" -t "/eletechsup/$T" -m '0' -q 1 -r; done
+```
+
+## Metrics and tags (DogStatsD)
+- UDP to Datadog Agent: host `<AGENT_HOSTNAME_OR_IP>`, port `8125`
+- Metric: `iot.pressure` (gauge), one per input:
+  - Vi1 → `channel:vi1`, `location:tank`
+  - Vi2 → `channel:vi2`, `location:house`
+  - Vi3 → `channel:vi3`, `location:prefilter`
+  - Vi4 → `channel:vi4`, `location:postfilter`
+- Common tags: `env:prod`, `sensor:transducer`, `source:eletechsup`, `service:water`, `unit:psi`
+
+## Build & upload (Arduino CLI)
+```bash
 arduino-cli compile --fqbn esp32:esp32:esp32 .
 arduino-cli upload -p /dev/cu.usbserial-0001 --fqbn esp32:esp32:esp32 .
 ```
-Adjust the serial port path if different.
 
-## File of interest
-- `esp32-relay-test.ino` – main sketch driving the relays via 74HC595.
-
-## Troubleshooting
-- If no clicks: ensure 12V power present; DIP SW1 set to Io1/Io2 ON; reseat ESP32; check that `/dev/cu.usbserial-...` exists; try pressing EN after upload.
-- If only one channel toggles: wiring may differ; verify continuity from ESP32 pins to 74HC595 pins as above.
+## Notes
+- Ensure the Datadog Agent exposes DogStatsD on UDP 8125 and allows non‑local traffic.
+- Keep credentials out of commits; use placeholders in code or untracked config.
+- ADC pins: Vi1=GPIO14 (ADC2), Vi2=GPIO33 (ADC1), Vi3=GPIO27 (ADC2), Vi4=GPIO32 (ADC1)
