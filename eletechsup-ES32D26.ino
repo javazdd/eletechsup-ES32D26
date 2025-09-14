@@ -13,18 +13,18 @@
 #include <HTTPClient.h>
 
 // ------------ Network (static IP) ------------
-const char* WIFI_SSID = "PrediccioNet";
-const char* WIFI_PASS = "emulsify.impearl.tress";
+const char* WIFI_SSID = "<YOUR_WIFI_SSID>";
+const char* WIFI_PASS = "<YOUR_WIFI_PASSWORD>";
 IPAddress STATIC_IP(192,168,88,206);
 IPAddress GATEWAY(192,168,88,1);
 IPAddress SUBNET(255,255,255,0);
 IPAddress DNS1(8,8,8,8);
 
 // ------------ MQTT ------------
-const char* MQTT_HOST = "192.168.88.205";
+const char* MQTT_HOST = "<MQTT_HOST>";
 const uint16_t MQTT_PORT = 1883;
-const char* MQTT_USER = "eletechsup";
-const char* MQTT_PASS = "ngv1udw0YBZ!ygk.tru";
+const char* MQTT_USER = "<MQTT_USER>";
+const char* MQTT_PASS = "<MQTT_PASS>";
 
 // Topics (subscribe to both with and without leading slash for safety)
 const char* topics_slash[] = {
@@ -40,7 +40,7 @@ const char* INPUT_BASE_TOPIC = "/eletechsup/inputs";
 
 // ------------ DogStatsD ------------
 // DogStatsD disabled; using HTTPS metrics intake instead
-IPAddress DD_HOST(192,168,88,205); // retained for compatibility (unused)
+const char* DD_HOST = "<AGENT_HOSTNAME_OR_IP>"; // retained for compatibility (unused)
 const uint16_t DD_PORT = 8125;     // unused
 WiFiUDP ddUdp;                     // unused
 
@@ -103,6 +103,7 @@ PubSubClient mqtt(net);
 unsigned long lastSampleMs = 0;
 bool timeSynced = false;
 unsigned long timerStartMs = 0; // 0 means not started
+bool mqttSubscribed = false;    // subscribe only once with persistent session
 
 static int readAvgMilliVolts(int pin, int samples=8){ long acc=0; for(int i=0;i<samples;i++){ acc += analogReadMilliVolts(pin); delay(2);} return (int)(acc/samples); }
 
@@ -261,11 +262,14 @@ void ensureMqtt(){
     else if(t.endsWith("100"))    handle(5, "100");
     else if(t.endsWith("50"))     handle(6, "50");
   });
-  // persistent session to receive retained msgs during reconnects
-  if(mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS, nullptr, 0, false, nullptr, true)){
+  // persistent session: cleanSession=false so existing subs are preserved
+  if(mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS, nullptr, 0, false, nullptr, false)){
     digitalWrite(LED_MQTT, HIGH);
-    for(const char* s: topics_slash) mqtt.subscribe(s, 1);
-    for(const char* s: topics)      mqtt.subscribe(s, 1);
+    if(!mqttSubscribed){
+      for(const char* s: topics_slash) mqtt.subscribe(s, 1);
+      for(const char* s: topics)      mqtt.subscribe(s, 1);
+      mqttSubscribed = true;
+    }
   } else {
     digitalWrite(LED_MQTT, LOW);
   }
