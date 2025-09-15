@@ -21,6 +21,29 @@ Firmware for the Eletechsup 2AO-8AI-8DI-8DO board (ES32D26) using an ESP32-DevKi
   - ch6 → `50`          → topic `/eletechsup/50`
 
 ## MQTT control
+
+## MQTT input voltages (subscribe)
+- Host: <MQTT_HOST>
+- Port: <MQTT_PORT>
+- User: <MQTT_USER>
+- Pass: <MQTT_PASS>
+
+All inputs (retained shown immediately):
+```bash
+mosquitto_sub -h <MQTT_HOST> -p <MQTT_PORT> -u "<MQTT_USER>" -P "<MQTT_PASS>" -t "/eletechsup/inputs/#" -v
+```
+
+Live-only (ignore retained):
+```bash
+mosquitto_sub -R -h <MQTT_HOST> -p <MQTT_PORT> -u "<MQTT_USER>" -P "<MQTT_PASS>" -t "/eletechsup/inputs/#" -v
+```
+
+Single channel example (Vi4):
+```bash
+mosquitto_sub -h <MQTT_HOST> -p <MQTT_PORT> -u "<MQTT_USER>" -P "<MQTT_PASS>" -t "/eletechsup/inputs/vi4" -v
+```
+
+
 - Host: `<MQTT_HOST>` (e.g., 192.168.88.205)
 - Port: `<MQTT_PORT>` (e.g., 1883)
 - User: `<MQTT_USER>`
@@ -55,3 +78,8 @@ arduino-cli upload -p /dev/cu.usbserial-0001 --fqbn esp32:esp32:esp32 .
 - Ensure the Datadog Agent exposes DogStatsD on UDP 8125 and allows non‑local traffic.
 - Keep credentials out of commits; use placeholders in code or untracked config.
 - ADC pins: Vi1=GPIO14 (ADC2), Vi2=GPIO33 (ADC1), Vi3=GPIO27 (ADC2), Vi4=GPIO32 (ADC1)
+
+## Networking
+- Static IP: 192.168.88.203 (configured in firmware)
+- Hostname: eletechsup (set via WiFi.setHostname)
+
