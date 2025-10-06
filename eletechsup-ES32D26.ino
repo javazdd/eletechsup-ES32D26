@@ -2,7 +2,7 @@
 // - Static IP
 // - Samples Vi1..Vi4 every 15s (brief WiFi-off windows for ADC2)
 // - Publishes iot.pressure (PSI) gauges via DogStatsD with tags
-// - Subscribes to relay topics and energizes/de-energizes relays 1..6
+// - Subscribes to relay topics and energizes/de-energizes relays 1..6 (+7 pump)
 // - Starts a 300s master timer on first command; after 300s all relays turn off
 
 #include <Arduino.h>
@@ -11,38 +11,63 @@
 #include <WiFiUdp.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <stdarg.h>
+
+// Forward declaration so helpers can reference the global MQTT client
+class PubSubClient; extern PubSubClient mqtt;
+
+// Feature flags
+#define FLOW_METRICS_ENABLED 1
 
 // ------------ Network (static IP) ------------
-const char* WIFI_SSID = "<YOUR_WIFI_SSID>";
-const char* WIFI_PASS = "<YOUR_WIFI_PASSWORD>";
+const char* WIFI_SSID = "PrediccioNet";
+const char* WIFI_PASS = "emulsify.impearl.tress";
 IPAddress STATIC_IP(192,168,88,206);
 IPAddress GATEWAY(192,168,88,1);
 IPAddress SUBNET(255,255,255,0);
 IPAddress DNS1(8,8,8,8);
 
 // ------------ MQTT ------------
-const char* MQTT_HOST = "<MQTT_HOST>";
+const char* MQTT_HOST = "192.168.88.205";
 const uint16_t MQTT_PORT = 1883;
-const char* MQTT_USER = "<MQTT_USER>";
-const char* MQTT_PASS = "<MQTT_PASS>";
+const char* MQTT_USER = "eletechsup";
+const char* MQTT_PASS = "ngv1udw0YBZ!ygk.tru";
 
 // Topics (subscribe to both with and without leading slash for safety)
 const char* topics_slash[] = {
-  "/eletechsup/prefilter","/eletechsup/postfilter","/eletechsup/500","/eletechsup/250","/eletechsup/100","/eletechsup/50"
+  "/eletechsup/prefilter","/eletechsup/postfilter","/eletechsup/500","/eletechsup/250","/eletechsup/100","/eletechsup/50","/eletechsup/pump"
 };
 const char* topics[] = {
-  "eletechsup/prefilter","eletechsup/postfilter","eletechsup/500","eletechsup/250","eletechsup/100","eletechsup/50"
+  "eletechsup/prefilter","eletechsup/postfilter","eletechsup/500","eletechsup/250","eletechsup/100","eletechsup/50","eletechsup/pump"
 };
 // Base topic to publish input terminal voltages
 const char* INPUT_BASE_TOPIC = "/eletechsup/inputs";
 // channel index map (0-based relay number)
 // ch1=prefilter, ch2=postfilter, ch3=500, ch4=250, ch5=100, ch6=50
 
+// ------------ Home Assistant Discovery ------------
+static const char* HA_PREFIX = "homeassistant";
+static const char* DEVICE_ID = "esp32_water";
+static const char* AVAIL_TOPIC = "esp32_water/status";
+
 // ------------ DogStatsD ------------
 // DogStatsD disabled; using HTTPS metrics intake instead
-const char* DD_HOST = "<AGENT_HOSTNAME_OR_IP>"; // retained for compatibility (unused)
+const char* DD_HOST = "192.168.88.204"; // DogStatsD Agent host
 const uint16_t DD_PORT = 8125;     // unused
 WiFiUDP ddUdp;                     // unused
+// Debug counters for UDP DogStatsD sends
+volatile uint32_t dd_udp_ok = 0;
+volatile uint32_t dd_udp_err = 0;
+
+// Safe snprintf appender to avoid buffer overflows when batching metrics
+static inline void add_snprintf(char* buf, size_t size, size_t& n, const char* fmt, ...){
+  if(n >= size) return;
+  va_list ap; va_start(ap, fmt);
+  int ret = vsnprintf(buf + n, size - n, fmt, ap);
+  va_end(ap);
+  if(ret < 0) return;
+  if((size_t)ret >= (size - n)) n = size - 1; else n += (size_t)ret;
+}
 
 // Datadog HTTPS intake (US1 site)
 static const char* DD_API_HOST = "https://api.datadoghq.com";
@@ -65,6 +90,23 @@ static constexpr float ADC_TO_TERMINAL_GAIN = 5.0f;   // observed board scaling 
 static constexpr float SENSOR_FS_VOLTS      = 5.0f;   // 0..5V sensor
 static constexpr float PSI_FS[4]            = {5.0f, 60.0f, 60.0f, 100.0f};
 int vi_mV[4] = {0,0,0,0};
+
+// ------------ Flow meters (pulse inputs) ------------
+// IO18 and IO19 as interrupt-capable pulse counters
+const int FLOW1_PIN = 18;
+const int FLOW2_PIN = 19;
+// K-factor: pulses per liter (update to your sensor's spec). Using placeholder default.
+static constexpr float FLOW_K_PPL = 450.0f; // pulses/L (typical YF-S201 ~450-480)
+volatile uint32_t flow1_pulses = 0;
+volatile uint32_t flow2_pulses = 0;
+unsigned long lastFlowPublishMs = 0;
+float flow1_hz_last = 0.0f;
+float flow2_hz_last = 0.0f;
+float flow1_lpm_last = 0.0f;
+float flow2_lpm_last = 0.0f;
+
+void IRAM_ATTR flow1_isr(){ flow1_pulses++; }
+void IRAM_ATTR flow2_isr(){ flow2_pulses++; }
 
 // ------------ Relays via 74HC595 + ULN2803 ------------
 const int SR_DATA  = 12;
@@ -97,6 +139,61 @@ void setRelay(int ch, bool on){ // ch:1..8
   if(srState != before){ srWrite(srState); }
 }
 
+static void publishRelayStateTopic(const char* name, int ch){
+  // state topics separate from command topics for HA
+  String topic = String("/eletechsup/") + name + "/state";
+  const char* payload = ((srState >> ((ch<=6)? ( (ch<=6)? ((ch<=6)? ( (ch>=1 && ch<=6) ? RELAY_BIT_FOR_CHANNEL[ch-1] : (uint8_t)(ch-1) ) : 0 ) : 0 ) : 0 )) & 1) ? "1" : "0"; // compute based on srState
+  mqtt.publish(topic.c_str(), payload, true);
+}
+
+static void publishAllRelayStates(){
+  publishRelayStateTopic("prefilter", 1);
+  publishRelayStateTopic("postfilter", 2);
+  publishRelayStateTopic("500", 3);
+  publishRelayStateTopic("250", 4);
+  publishRelayStateTopic("100", 5);
+  publishRelayStateTopic("50", 6);
+  publishRelayStateTopic("pump", 7);
+}
+
+static void publishHADiscovery(){
+  if(!mqtt.connected()) return;
+  auto pubcfg = [&](const char* comp, const char* obj, const char* json){
+    String t = String(HA_PREFIX) + "/" + comp + "/" + DEVICE_ID + "/" + obj + "/config";
+    mqtt.publish(t.c_str(), json, true);
+  };
+  char buf[640];
+  // Switches 1..6 + pump (7)
+  struct Item{ const char* name; const char* cmd; const char* st; const char* uid; };
+  Item sws[] = {
+    {"prefilter","/eletechsup/prefilter","/eletechsup/prefilter/state","esp32_water_prefilter"},
+    {"postfilter","/eletechsup/postfilter","/eletechsup/postfilter/state","esp32_water_postfilter"},
+    {"500","/eletechsup/500","/eletechsup/500/state","esp32_water_500"},
+    {"250","/eletechsup/250","/eletechsup/250/state","esp32_water_250"},
+    {"100","/eletechsup/100","/eletechsup/100/state","esp32_water_100"},
+    {"50","/eletechsup/50","/eletechsup/50/state","esp32_water_50"},
+    {"pump","/eletechsup/pump","/eletechsup/pump/state","esp32_water_pump"}
+  };
+  for(auto &it: sws){
+    snprintf(buf, sizeof(buf),
+      "{\"name\":\"%s\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"pl_on\":\"1\",\"pl_off\":\"0\",\"avty_t\":\"%s\",\"uniq_id\":\"%s\",\"qos\":1,\"ret\":true,\"device\":{\"ids\":[\"%s\"],\"name\":\"ES32D26\",\"mf\":\"eletechsup\",\"mdl\":\"ES32D26\"}}",
+      it.name, it.cmd, it.st, AVAIL_TOPIC, it.uid, DEVICE_ID);
+    pubcfg("switch", it.name, buf);
+  }
+  // Flow sensors
+  struct Sen{ const char* name; const char* st; const char* uid; const char* unit; };
+  Sen sens[] = {
+    {"flow1_lpm","/eletechsup/flow1_lpm","esp32_water_flow1_lpm","L/min"},
+    {"flow2_lpm","/eletechsup/flow2_lpm","esp32_water_flow2_lpm","L/min"}
+  };
+  for(auto &s: sens){
+    snprintf(buf, sizeof(buf),
+      "{\"name\":\"%s\",\"stat_t\":\"%s\",\"unit_of_meas\":\"%s\",\"avty_t\":\"%s\",\"uniq_id\":\"%s\",\"dev_cla\":\"none\",\"state_class\":\"measurement\",\"device\":{\"ids\":[\"%s\"]}}",
+      s.name, s.st, s.unit, AVAIL_TOPIC, s.uid, DEVICE_ID);
+    pubcfg("sensor", s.name, buf);
+  }
+}
+
 // ------------ Globals ------------
 WiFiClient net;
 PubSubClient mqtt(net);
@@ -104,18 +201,30 @@ unsigned long lastSampleMs = 0;
 bool timeSynced = false;
 unsigned long timerStartMs = 0; // 0 means not started
 bool mqttSubscribed = false;    // subscribe only once with persistent session
+bool ha_announced = false;      // HA discovery published once per connection
+bool avail_online = false;      // availability online flag
 
 static int readAvgMilliVolts(int pin, int samples=8){ long acc=0; for(int i=0;i<samples;i++){ acc += analogReadMilliVolts(pin); delay(2);} return (int)(acc/samples); }
 
 // Batch-read ADC2 inputs (Vi1, Vi3) during a single WiFi-off window
 static void readADC2Pair(){
   // Turn WiFi off once
+  // Ensure MQTT is cleanly disconnected before tearing down Wi‑Fi to avoid lwIP pbuf issues
+  if(mqtt.connected()){
+    mqtt.disconnect();
+    mqttSubscribed = false;
+    ha_announced = false;
+    avail_online = false;
+    delay(20);
+  }
   WiFi.disconnect(true,true); WiFi.mode(WIFI_OFF); delay(120);
   // Read ADC2 channels
   vi_mV[0] = readAvgMilliVolts(VI1_PIN, 8);
   vi_mV[2] = readAvgMilliVolts(VI3_PIN, 8);
   // Reconnect WiFi once
-  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.mode(WIFI_STA);
+  WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS1);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long t=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t<8000){ delay(80);} 
   digitalWrite(LED_WIFI, WiFi.isConnected()?HIGH:LOW);
   // Re-bind UDP socket after radio cycle
@@ -125,6 +234,7 @@ static void readADC2Pair(){
 void ensureWiFi(){
   if(WiFi.status()==WL_CONNECTED) return;
   WiFi.mode(WIFI_STA);
+  WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS1);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long start=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-start<10000){ delay(150);} 
   digitalWrite(LED_WIFI, WiFi.isConnected()?HIGH:LOW);
@@ -221,10 +331,10 @@ static void ddMetricGaugePsiDog(const char* channelTag, const char* locationTag,
   char buf[256];
   if(locationTag && *locationTag){
     int n = snprintf(buf, sizeof(buf), "iot.pressure:%0.3f|g|#%s,channel:%s,location:%s,unit:psi\n", psi, DD_COMMON_TAGS, channelTag, locationTag);
-    ddUdp.beginPacket(DD_HOST, DD_PORT); ddUdp.write((uint8_t*)buf, n); ddUdp.endPacket();
+    ddUdp.beginPacket(DD_HOST, DD_PORT); ddUdp.write((uint8_t*)buf, n); int rc = ddUdp.endPacket(); if(rc==1) dd_udp_ok++; else dd_udp_err++;
   } else {
     int n = snprintf(buf, sizeof(buf), "iot.pressure:%0.3f|g|#%s,channel:%s,unit:psi\n", psi, DD_COMMON_TAGS, channelTag);
-    ddUdp.beginPacket(DD_HOST, DD_PORT); ddUdp.write((uint8_t*)buf, n); ddUdp.endPacket();
+    ddUdp.beginPacket(DD_HOST, DD_PORT); ddUdp.write((uint8_t*)buf, n); int rc = ddUdp.endPacket(); if(rc==1) dd_udp_ok++; else dd_udp_err++;
   }
 }
 
@@ -233,17 +343,17 @@ static void ddMetricGaugeVoltsDog(const char* channelTag, const char* locationTa
   char buf[256];
   if(locationTag && *locationTag){
     int n = snprintf(buf, sizeof(buf), "iot.voltage:%0.3f|g|#%s,channel:%s,location:%s,unit:v\n", volts, DD_COMMON_TAGS, channelTag, locationTag);
-    ddUdp.beginPacket(DD_HOST, DD_PORT); ddUdp.write((uint8_t*)buf, n); ddUdp.endPacket();
+    ddUdp.beginPacket(DD_HOST, DD_PORT); ddUdp.write((uint8_t*)buf, n); int rc = ddUdp.endPacket(); if(rc==1) dd_udp_ok++; else dd_udp_err++;
   } else {
     int n = snprintf(buf, sizeof(buf), "iot.voltage:%0.3f|g|#%s,channel:%s,unit:v\n", volts, DD_COMMON_TAGS, channelTag);
-    ddUdp.beginPacket(DD_HOST, DD_PORT); ddUdp.write((uint8_t*)buf, n); ddUdp.endPacket();
+    ddUdp.beginPacket(DD_HOST, DD_PORT); ddUdp.write((uint8_t*)buf, n); int rc = ddUdp.endPacket(); if(rc==1) dd_udp_ok++; else dd_udp_err++;
   }
 }
 
 void ensureMqtt(){
   if(mqtt.connected()) return;
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  String clientId = String("es32d26-") + String((uint32_t)ESP.getEfuseMac(), HEX);
+  String clientId = String("esp32_water-") + String((uint32_t)ESP.getEfuseMac(), HEX);
   mqtt.setBufferSize(512);
   mqtt.setCallback([](char* topic, byte* payload, unsigned int len){
     String t(topic);
@@ -254,6 +364,9 @@ void ensureMqtt(){
       if(p == "1"){ setRelay(ch, true); Serial.printf("MQTT %s -> ON\n", name); ddEvent((String("ch")+ch+" energized").c_str(), name); }
       else if(p == "0"){ setRelay(ch, false); Serial.printf("MQTT %s -> OFF\n", name); ddEvent((String("ch")+ch+" deenergized").c_str(), name); }
       if(timerStartMs==0) timerStartMs = millis();
+      // Publish state topic for HA
+      String st = String("/eletechsup/") + name + "/state";
+      mqtt.publish(st.c_str(), (p=="1")?"1":"0", true);
     };
     if(t.endsWith("prefilter"))   handle(1, "prefilter");
     else if(t.endsWith("postfilter")) handle(2, "postfilter");
@@ -261,17 +374,22 @@ void ensureMqtt(){
     else if(t.endsWith("250"))    handle(4, "250");
     else if(t.endsWith("100"))    handle(5, "100");
     else if(t.endsWith("50"))     handle(6, "50");
+    else if(t.endsWith("pump"))   handle(7, "pump");
   });
   // persistent session: cleanSession=false so existing subs are preserved
   if(mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS, nullptr, 0, false, nullptr, false)){
     digitalWrite(LED_MQTT, HIGH);
+    if(!avail_online){ mqtt.publish(AVAIL_TOPIC, "online", true); avail_online = true; }
     if(!mqttSubscribed){
       for(const char* s: topics_slash) mqtt.subscribe(s, 1);
       for(const char* s: topics)      mqtt.subscribe(s, 1);
       mqttSubscribed = true;
     }
+    if(!ha_announced){ publishHADiscovery(); ha_announced = true; }
+    publishAllRelayStates();
   } else {
     digitalWrite(LED_MQTT, LOW);
+    avail_online = false; // don't publish while disconnected
   }
 }
 
@@ -291,7 +409,7 @@ void sampleAndPublish(){
   unsigned long settleStart = millis();
   while(millis() - settleStart < 1200){
     ensureMqtt();
-    mqtt.loop();
+    if(mqtt.connected()) mqtt.loop(); else delay(50);
     delay(50);
   }
 
@@ -309,26 +427,88 @@ void sampleAndPublish(){
     publishVolts("vi2", vi_mV[1]);
     publishVolts("vi3", vi_mV[2]);
     publishVolts("vi4", vi_mV[3]);
+    // Also publish flow cached values to MQTT
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%0.3f", flow1_lpm_last); mqtt.publish("/eletechsup/flow1_lpm", buf, true); // tank
+    snprintf(buf, sizeof(buf), "%0.3f", flow2_lpm_last); mqtt.publish("/eletechsup/flow2_lpm", buf, true); // house
+    snprintf(buf, sizeof(buf), "%0.1f", flow1_hz_last);  mqtt.publish("/eletechsup/flow1_hz", buf, true);
+    snprintf(buf, sizeof(buf), "%0.1f", flow2_hz_last);  mqtt.publish("/eletechsup/flow2_hz", buf, true);
   }
 
-  // Metrics via DogStatsD (UDP): pressure and voltage
+  // Metrics via DogStatsD (UDP): pressure and voltage (BATCHEd into ONE packet)
   float v1 = (vi_mV[0] / 1000.0f) * ADC_TO_TERMINAL_GAIN;
   float v2 = (vi_mV[1] / 1000.0f) * ADC_TO_TERMINAL_GAIN;
   float v3 = (vi_mV[2] / 1000.0f) * ADC_TO_TERMINAL_GAIN;
   float v4 = (vi_mV[3] / 1000.0f) * ADC_TO_TERMINAL_GAIN;
 
-  ddMetricGaugePsiDog("vi1", "tank",      mvToPsi(vi_mV[0],0));
-  ddMetricGaugePsiDog("vi2", "house",     mvToPsi(vi_mV[1],1));
-  ddMetricGaugePsiDog("vi3", "prefilter", mvToPsi(vi_mV[2],2));
-  ddMetricGaugePsiDog("vi4", "postfilter", mvToPsi(vi_mV[3],3));
+  float p1 = mvToPsi(vi_mV[0],0);
+  float p2 = mvToPsi(vi_mV[1],1);
+  float p3 = mvToPsi(vi_mV[2],2);
+  float p4 = mvToPsi(vi_mV[3],3);
 
-  ddMetricGaugeVoltsDog("vi1", "tank",      v1);
-  ddMetricGaugeVoltsDog("vi2", "house",     v2);
-  ddMetricGaugeVoltsDog("vi3", "prefilter", v3);
-  ddMetricGaugeVoltsDog("vi4", "postfilter", v4);
+  // Per-metric packets to guarantee visibility and avoid truncation
+  auto send_line = [&](const char* fmt, ...){
+    char line[200];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if(n > 0){ ddUdp.beginPacket(DD_HOST, DD_PORT); ddUdp.write((uint8_t*)line, (size_t)n); int rc=ddUdp.endPacket(); if(rc==1) dd_udp_ok++; else dd_udp_err++; Serial.print("DD: "); Serial.print(line); }
+  };
+  send_line("iot.pressure:%0.3f|g|#%s,channel:vi1,location:tank,unit:psi\n", p1, DD_COMMON_TAGS);
+  send_line("iot.pressure:%0.3f|g|#%s,channel:vi2,location:house,unit:psi\n", p2, DD_COMMON_TAGS);
+  send_line("iot.pressure:%0.3f|g|#%s,channel:vi3,location:prefilter,unit:psi\n", p3, DD_COMMON_TAGS);
+  send_line("iot.pressure:%0.3f|g|#%s,channel:vi4,location:postfilter,unit:psi\n", p4, DD_COMMON_TAGS);
+  send_line("iot.voltage:%0.3f|g|#%s,channel:vi1,location:tank,unit:v\n", v1, DD_COMMON_TAGS);
+  send_line("iot.voltage:%0.3f|g|#%s,channel:vi2,location:house,unit:v\n", v2, DD_COMMON_TAGS);
+  send_line("iot.voltage:%0.3f|g|#%s,channel:vi3,location:prefilter,unit:v\n", v3, DD_COMMON_TAGS);
+  send_line("iot.voltage:%0.3f|g|#%s,channel:vi4,location:postfilter,unit:v\n", v4, DD_COMMON_TAGS);
+
+  // Add flow metrics (Flow1=tank, Flow2=house)
+  #if FLOW_METRICS_ENABLED
+  {
+    auto send_line = [&](const char* fmt, ...){
+      char line[160];
+      va_list ap; va_start(ap, fmt);
+      int n = vsnprintf(line, sizeof(line), fmt, ap);
+      va_end(ap);
+      if(n > 0){ ddUdp.beginPacket(DD_HOST, DD_PORT); ddUdp.write((uint8_t*)line, (size_t)n); int rc=ddUdp.endPacket(); if(rc==1) dd_udp_ok++; else dd_udp_err++; Serial.print("DD: "); Serial.print(line); }
+    };
+    // Flow1=tank, Flow2=house
+    send_line("iot.flow:%0.3f|g|#%s,channel:tank,unit:l_per_min\n", flow1_lpm_last, DD_COMMON_TAGS);
+    send_line("iot.flow_hz:%0.1f|g|#%s,channel:tank,unit:hz\n", flow1_hz_last, DD_COMMON_TAGS);
+    send_line("iot.flow:%0.3f|g|#%s,channel:house,unit:l_per_min\n", flow2_lpm_last, DD_COMMON_TAGS);
+    send_line("iot.flow_hz:%0.1f|g|#%s,channel:house,unit:hz\n", flow2_hz_last, DD_COMMON_TAGS);
+  }
+  #endif
 
   Serial.printf("PSI vi1:%0.2f vi2:%0.2f vi3:%0.2f vi4:%0.2f | V vi1:%0.3f vi2:%0.3f vi3:%0.3f vi4:%0.3f\n",
-    mvToPsi(vi_mV[0],0), mvToPsi(vi_mV[1],1), mvToPsi(vi_mV[2],2), mvToPsi(vi_mV[3],3), v1, v2, v3, v4);
+    p1, p2, p3, p4, v1, v2, v3, v4);
+  Serial.printf("Flow tank LPM:%0.3f Hz:%0.1f | house LPM:%0.3f Hz:%0.1f\n", flow1_lpm_last, flow1_hz_last, flow2_lpm_last, flow2_hz_last);
+  Serial.printf("DD UDP ok:%lu err:%lu host:%s\n", (unsigned long)dd_udp_ok, (unsigned long)dd_udp_err, DD_HOST);
+}
+
+// Publish flow meter metrics approximately every second while MQTT is connected
+static void publishFlowIfDue(){
+  unsigned long now = millis();
+  if(now - lastFlowPublishMs < 1000) return;
+  lastFlowPublishMs = now;
+  // Atomically read and reset pulse counters
+  uint32_t p1, p2;
+  noInterrupts(); p1 = flow1_pulses; flow1_pulses = 0; p2 = flow2_pulses; flow2_pulses = 0; interrupts();
+  // Convert pulses in last interval to frequency (Hz) and flow (L/min)
+  float seconds = (now % 1000 == 0) ? 1.0f : ( (now - (now - 1000)) / 1000.0f ); // ~1s
+  float f1_hz = p1 / seconds;
+  float f2_hz = p2 / seconds;
+  float f1_lpm = (p1 / FLOW_K_PPL) * 60.0f / seconds;
+  float f2_lpm = (p2 / FLOW_K_PPL) * 60.0f / seconds;
+  flow1_hz_last = f1_hz; flow2_hz_last = f2_hz; flow1_lpm_last = f1_lpm; flow2_lpm_last = f2_lpm;
+  if(mqtt.connected()){
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%0.3f", f1_lpm); mqtt.publish("/eletechsup/flow1_lpm", buf, true);
+    snprintf(buf, sizeof(buf), "%0.3f", f2_lpm); mqtt.publish("/eletechsup/flow2_lpm", buf, true);
+    snprintf(buf, sizeof(buf), "%0.1f", f1_hz);  mqtt.publish("/eletechsup/flow1_hz", buf, true);
+    snprintf(buf, sizeof(buf), "%0.1f", f2_hz);  mqtt.publish("/eletechsup/flow2_hz", buf, true);
+  }
 }
 
 void setup(){
@@ -338,21 +518,31 @@ void setup(){
   pinMode(SR_DATA, OUTPUT); pinMode(SR_CLK, OUTPUT); pinMode(SR_LATCH, OUTPUT); pinMode(SR_OE, OUTPUT);
   digitalWrite(SR_DATA, LOW); digitalWrite(SR_CLK, LOW); digitalWrite(SR_LATCH, HIGH); digitalWrite(SR_OE, LOW);
   srWrite(srState);
+  // Hostname
+  WiFi.setHostname("esp32_water");
   // ADC
   analogReadResolution(12);
   analogSetPinAttenuation(VI1_PIN, ADC_11db);
   analogSetPinAttenuation(VI2_PIN, ADC_11db);
   analogSetPinAttenuation(VI3_PIN, ADC_11db);
   analogSetPinAttenuation(VI4_PIN, ADC_11db);
+  // Flow meters
+  pinMode(FLOW1_PIN, INPUT_PULLUP);
+  pinMode(FLOW2_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(FLOW1_PIN), flow1_isr, RISING);
+  attachInterrupt(digitalPinToInterrupt(FLOW2_PIN), flow2_isr, RISING);
   // Net
-  ensureWiFi(); ensureMqtt();
+  ensureWiFi();
+  // Stagger MQTT connect a bit to let Wi-Fi settle
+  delay(300);
+  ensureMqtt();
   ddUdp.begin(0);
   // Prime metrics
   sampleAndPublish();
 }
 
 void loop(){
-  ensureWiFi(); ensureMqtt(); mqtt.loop();
+  ensureWiFi(); ensureMqtt(); if(mqtt.connected()) mqtt.loop();
   unsigned long now = millis();
   if(now - lastSampleMs >= 15000){ lastSampleMs = now; sampleAndPublish(); }
   if(timerStartMs && (now - timerStartMs >= 300000UL)){
@@ -361,4 +551,7 @@ void loop(){
     for(int ch=1; ch<=6; ++ch){ bool wasOn = (srState >> (ch-1)) & 1; setRelay(ch, false); if(wasOn) ddEvent((String("ch")+ch+" deenergized").c_str(), chTag[ch-1]); }
     timerStartMs = 0; // stop timer until next command
   }
+  // LWT availability heartbeat
+  static unsigned long lastAvail = 0; if(now - lastAvail > 30000UL){ lastAvail = now; if(mqtt.connected()) mqtt.publish(AVAIL_TOPIC, "online", true); }
+  publishFlowIfDue();
 }
