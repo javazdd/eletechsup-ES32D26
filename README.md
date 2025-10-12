@@ -1,11 +1,15 @@
 # eletechsup-ES32D26 (ESP32 firmware)
 
+Version: 0.2.0
+
 Firmware for the Eletechsup 2AO-8AI-8DI-8DO board (ES32D26) using an ESP32-DevKitC.
 
 ## What it does
 - Connects to Wi‑Fi and MQTT
 - Subscribes to topics and energizes/de‑energizes relays based on MQTT payloads
 - Samples 4 pressure transducers (Vi1..Vi4) every 15s
+- Counts 2 flow meters (IO18=tank, IO19=house) and publishes L/min and Hz
+- Controls a peristaltic pump on channel 7 (relay bit mapped uniquely)
 - Publishes `iot.pressure` as DogStatsD metrics to a Datadog Agent with rich tags
 - Auto safety: after 300s from first MQTT command, turns all relays OFF
 
@@ -19,8 +23,9 @@ Firmware for the Eletechsup 2AO-8AI-8DI-8DO board (ES32D26) using an ESP32-DevKi
   - ch4 → `250`         → topic `/eletechsup/250`
   - ch5 → `100`         → topic `/eletechsup/100`
   - ch6 → `50`          → topic `/eletechsup/50`
+  - ch7 → `pump`        → topic `/eletechsup/pump`
 
-## MQTT control
+## MQTT control (relays)
 
 ## MQTT input voltages (subscribe)
 - Host: <MQTT_HOST>
@@ -59,6 +64,18 @@ for T in prefilter postfilter 500 250 100 50; do mosquitto_pub -h "$HOST" -p "$P
 for T in prefilter postfilter 500 250 100 50; do mosquitto_pub -h "$HOST" -p "$PORT" -u "$USER" -P "$PASS" -t "/eletechsup/$T" -m '0' -q 1 -r; done
 ```
 
+## Flow meters (MQTT + HA Discovery)
+- Topics (retained):
+  - Tank LPM: `/eletechsup/flow1_lpm`
+  - House LPM: `/eletechsup/flow2_lpm`
+  - Tank Hz: `/eletechsup/flow1_hz`
+  - House Hz: `/eletechsup/flow2_hz`
+- Home Assistant Discovery (retained):
+  - `homeassistant/sensor/esp32_water/flow_tank_lpm/config`
+  - `homeassistant/sensor/esp32_water/flow_house_lpm/config`
+  - `homeassistant/sensor/esp32_water/flow_tank_hz/config`
+  - `homeassistant/sensor/esp32_water/flow_house_hz/config`
+
 ## Metrics and tags (DogStatsD)
 - UDP to Datadog Agent: host `<AGENT_HOSTNAME_OR_IP>`, port `8125`
 - Metric: `iot.pressure` (gauge), one per input:
@@ -80,6 +97,6 @@ arduino-cli upload -p /dev/cu.usbserial-0001 --fqbn esp32:esp32:esp32 .
 - ADC pins: Vi1=GPIO14 (ADC2), Vi2=GPIO33 (ADC1), Vi3=GPIO27 (ADC2), Vi4=GPIO32 (ADC1)
 
 ## Networking
-- Static IP: 192.168.88.203 (configured in firmware)
-- Hostname: eletechsup (set via WiFi.setHostname)
+- Static IP: 192.168.88.206 (configured in firmware)
+- Hostname: esp32_water (set via WiFi.setHostname)
 

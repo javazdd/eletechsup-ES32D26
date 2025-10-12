@@ -46,6 +46,7 @@ const char* INPUT_BASE_TOPIC = "/eletechsup/inputs";
 // ch1=prefilter, ch2=postfilter, ch3=500, ch4=250, ch5=100, ch6=50
 
 // ------------ Home Assistant Discovery ------------
+static const char* FW_VERSION = "0.2.0";
 static const char* HA_PREFIX = "homeassistant";
 static const char* DEVICE_ID = "esp32_water";
 static const char* AVAIL_TOPIC = "esp32_water/status";
@@ -117,6 +118,15 @@ uint8_t srState = 0x00; // bits 0..7 => outputs
 // Map logical channels 1..6 to physical bit indices 2..7 (hardware wiring offset)
 static const uint8_t RELAY_BIT_FOR_CHANNEL[6] = {2,3,4,5,6,7};
 
+// Resolve the shift-register bit used for a given logical channel
+// Channels 1..6 map via RELAY_BIT_FOR_CHANNEL; channel 7 (pump) uses bit 1; channel 8 uses bit 0
+static inline uint8_t relayBitForChannel(int ch){
+  if(ch>=1 && ch<=6) return RELAY_BIT_FOR_CHANNEL[ch-1];
+  if(ch==7) return 1; // dedicate Q1 to pump to avoid collisions with channels 1..6
+  if(ch==8) return 0; // optional spare on Q0
+  return 0;
+}
+
 inline void srLatch(){ digitalWrite(SR_LATCH, LOW); digitalWrite(SR_LATCH, HIGH); }
 inline void srWrite(uint8_t value){
   for(int i=0;i<8;++i){
@@ -128,12 +138,8 @@ inline void srWrite(uint8_t value){
 }
 void setRelay(int ch, bool on){ // ch:1..8
   uint8_t before = srState;
-  if(ch>=1 && ch<=6){
-    uint8_t bit = RELAY_BIT_FOR_CHANNEL[ch-1];
-    if(on) srState |=  (1 << bit); else srState &= ~(1 << bit);
-  } else if(ch>=7 && ch<=8){
-    // pass-through for 7..8
-    uint8_t bit = (uint8_t)(ch-1);
+  if(ch>=1 && ch<=8){
+    uint8_t bit = relayBitForChannel(ch);
     if(on) srState |=  (1 << bit); else srState &= ~(1 << bit);
   }
   if(srState != before){ srWrite(srState); }
@@ -142,7 +148,8 @@ void setRelay(int ch, bool on){ // ch:1..8
 static void publishRelayStateTopic(const char* name, int ch){
   // state topics separate from command topics for HA
   String topic = String("/eletechsup/") + name + "/state";
-  const char* payload = ((srState >> ((ch<=6)? ( (ch<=6)? ((ch<=6)? ( (ch>=1 && ch<=6) ? RELAY_BIT_FOR_CHANNEL[ch-1] : (uint8_t)(ch-1) ) : 0 ) : 0 ) : 0 )) & 1) ? "1" : "0"; // compute based on srState
+  uint8_t bit = relayBitForChannel(ch);
+  const char* payload = ((srState >> bit) & 1) ? "1" : "0";
   mqtt.publish(topic.c_str(), payload, true);
 }
 
@@ -176,20 +183,30 @@ static void publishHADiscovery(){
   };
   for(auto &it: sws){
     snprintf(buf, sizeof(buf),
-      "{\"name\":\"%s\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"pl_on\":\"1\",\"pl_off\":\"0\",\"avty_t\":\"%s\",\"uniq_id\":\"%s\",\"qos\":1,\"ret\":true,\"device\":{\"ids\":[\"%s\"],\"name\":\"ES32D26\",\"mf\":\"eletechsup\",\"mdl\":\"ES32D26\"}}",
-      it.name, it.cmd, it.st, AVAIL_TOPIC, it.uid, DEVICE_ID);
+      "{\"name\":\"%s\",\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"pl_on\":\"1\",\"pl_off\":\"0\",\"avty_t\":\"%s\",\"uniq_id\":\"%s\",\"qos\":1,\"ret\":true,\"device\":{\"ids\":[\"%s\"],\"name\":\"ES32D26\",\"mf\":\"eletechsup\",\"mdl\":\"ES32D26\",\"sw\":\"%s\"}}",
+      it.name, it.cmd, it.st, AVAIL_TOPIC, it.uid, DEVICE_ID, FW_VERSION);
     pubcfg("switch", it.name, buf);
   }
-  // Flow sensors
+  // Flow sensors (tank/house), LPM and Hz
   struct Sen{ const char* name; const char* st; const char* uid; const char* unit; };
-  Sen sens[] = {
-    {"flow1_lpm","/eletechsup/flow1_lpm","esp32_water_flow1_lpm","L/min"},
-    {"flow2_lpm","/eletechsup/flow2_lpm","esp32_water_flow2_lpm","L/min"}
+  Sen sens_lpm[] = {
+    {"flow_tank_lpm","/eletechsup/flow1_lpm","esp32_water_flow_tank_lpm","L/min"},
+    {"flow_house_lpm","/eletechsup/flow2_lpm","esp32_water_flow_house_lpm","L/min"}
   };
-  for(auto &s: sens){
+  for(auto &s: sens_lpm){
     snprintf(buf, sizeof(buf),
-      "{\"name\":\"%s\",\"stat_t\":\"%s\",\"unit_of_meas\":\"%s\",\"avty_t\":\"%s\",\"uniq_id\":\"%s\",\"dev_cla\":\"none\",\"state_class\":\"measurement\",\"device\":{\"ids\":[\"%s\"]}}",
-      s.name, s.st, s.unit, AVAIL_TOPIC, s.uid, DEVICE_ID);
+      "{\"name\":\"%s\",\"stat_t\":\"%s\",\"unit_of_meas\":\"%s\",\"avty_t\":\"%s\",\"uniq_id\":\"%s\",\"state_class\":\"measurement\",\"device\":{\"ids\":[\"%s\"],\"name\":\"ES32D26\",\"mf\":\"eletechsup\",\"mdl\":\"ES32D26\",\"sw\":\"%s\"}}",
+      s.name, s.st, s.unit, AVAIL_TOPIC, s.uid, DEVICE_ID, FW_VERSION);
+    pubcfg("sensor", s.name, buf);
+  }
+  Sen sens_hz[] = {
+    {"flow_tank_hz","/eletechsup/flow1_hz","esp32_water_flow_tank_hz","Hz"},
+    {"flow_house_hz","/eletechsup/flow2_hz","esp32_water_flow_house_hz","Hz"}
+  };
+  for(auto &s: sens_hz){
+    snprintf(buf, sizeof(buf),
+      "{\"name\":\"%s\",\"stat_t\":\"%s\",\"unit_of_meas\":\"%s\",\"avty_t\":\"%s\",\"uniq_id\":\"%s\",\"state_class\":\"measurement\",\"device\":{\"ids\":[\"%s\"],\"name\":\"ES32D26\",\"mf\":\"eletechsup\",\"mdl\":\"ES32D26\",\"sw\":\"%s\"}}",
+      s.name, s.st, s.unit, AVAIL_TOPIC, s.uid, DEVICE_ID, FW_VERSION);
     pubcfg("sensor", s.name, buf);
   }
 }
@@ -201,6 +218,7 @@ unsigned long lastSampleMs = 0;
 bool timeSynced = false;
 unsigned long timerStartMs = 0; // 0 means not started
 bool mqttSubscribed = false;    // subscribe only once with persistent session
+bool flowDiscoveryPublished = false; // publish HA discovery for flow sensors once per session
 bool ha_announced = false;      // HA discovery published once per connection
 bool avail_online = false;      // availability online flag
 
@@ -387,6 +405,16 @@ void ensureMqtt(){
     }
     if(!ha_announced){ publishHADiscovery(); ha_announced = true; }
     publishAllRelayStates();
+    // Publish HA discovery for flow sensors (retained) once per session
+    if(!flowDiscoveryPublished){
+      const char* tank_cfg =
+        "{\"name\":\"flow_tank_lpm\",\"stat_t\":\"/eletechsup/flow1_lpm\",\"unit_of_meas\":\"L/min\",\"avty_t\":\"esp32_water/status\",\"uniq_id\":\"esp32_water_flow_tank_lpm\",\"state_class\":\"measurement\",\"device\":{\"ids\":[\"esp32_water\"],\"name\":\"ES32D26\",\"mf\":\"eletechsup\",\"mdl\":\"ES32D26\"}}";
+      const char* house_cfg =
+        "{\"name\":\"flow_house_lpm\",\"stat_t\":\"/eletechsup/flow2_lpm\",\"unit_of_meas\":\"L/min\",\"avty_t\":\"esp32_water/status\",\"uniq_id\":\"esp32_water_flow_house_lpm\",\"state_class\":\"measurement\",\"device\":{\"ids\":[\"esp32_water\"],\"name\":\"ES32D26\",\"mf\":\"eletechsup\",\"mdl\":\"ES32D26\"}}";
+      mqtt.publish("homeassistant/sensor/esp32_water/flow_tank_lpm/config", tank_cfg, true);
+      mqtt.publish("homeassistant/sensor/esp32_water/flow_house_lpm/config", house_cfg, true);
+      flowDiscoveryPublished = true;
+    }
   } else {
     digitalWrite(LED_MQTT, LOW);
     avail_online = false; // don't publish while disconnected
@@ -548,7 +576,7 @@ void loop(){
   if(timerStartMs && (now - timerStartMs >= 300000UL)){
     // Auto de-energize all
     const char* chTag[6] = {"prefilter","postfilter","500","250","100","50"};
-    for(int ch=1; ch<=6; ++ch){ bool wasOn = (srState >> (ch-1)) & 1; setRelay(ch, false); if(wasOn) ddEvent((String("ch")+ch+" deenergized").c_str(), chTag[ch-1]); }
+    for(int ch=1; ch<=6; ++ch){ bool wasOn = ((srState >> relayBitForChannel(ch)) & 1); setRelay(ch, false); if(wasOn) ddEvent((String("ch")+ch+" deenergized").c_str(), chTag[ch-1]); }
     timerStartMs = 0; // stop timer until next command
   }
   // LWT availability heartbeat
