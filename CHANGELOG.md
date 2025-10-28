@@ -1,3 +1,10 @@
+## 1.0.0 - 2025-10-28
+- ESPHome support added (`esphome/es32d26.yaml`) with OTA, HA API, flow meters, DogStatsD UDP, and SN74HC595 mapping
+- Finalized channel labels (ESPHome): ch1=50, ch2=100, ch3=250, ch4=500, ch5=Postfilter, ch6=Prefilter, ch7=Pump, ch8=UV
+- Removed auto-shutoff behavior from ESPHome path to avoid HA interference
+- Added HA-editable settings for MQTT and DogStatsD (ports integer only)
+- README updated with precise mapping and flashing instructions
+
 ## 0.2.0 - 2025-10-12
 - Add two flow meters on IO18 (tank) and IO19 (house), publish LPM and Hz
 - Add Home Assistant MQTT Discovery for flow sensors and pump switch

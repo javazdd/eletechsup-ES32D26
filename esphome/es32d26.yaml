@@ -1,0 +1,359 @@
+substitutions:
+  device_name: esp32_water
+  fw_version: 1.0.0-esphome
+
+esphome:
+  name: ${device_name}
+  comment: Eletechsup ES32D26 - ESPHome
+  project:
+    name: javazdd.eletechsup_es32d26
+    version: ${fw_version}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+
+api:
+
+ota:
+  platform: esphome
+  password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  fast_connect: true
+  manual_ip:
+    static_ip: 192.168.88.206
+    gateway: 192.168.88.1
+    subnet: 255.255.255.0
+    dns1: 1.1.1.1
+  use_address: 192.168.88.206
+
+captive_portal:
+
+time:
+  - platform: sntp
+
+# Shift register driving relays (SN74HC595 -> ULN2803A)
+sn74hc595:
+  - id: sr
+    data_pin: 12
+    clock_pin: 22
+    latch_pin: 23
+    oe_pin: 13
+
+output:
+  # Q1..Q7 map; channels 1..6 use Q2..Q7; pump uses Q1
+  - platform: gpio
+    id: sr_q0
+    pin:
+      sn74hc595: sr
+      number: 0
+  - platform: gpio
+    id: sr_q1
+    pin:
+      sn74hc595: sr
+      number: 1
+  - platform: gpio
+    id: sr_q2
+    pin:
+      sn74hc595: sr
+      number: 2
+  - platform: gpio
+    id: sr_q3
+    pin:
+      sn74hc595: sr
+      number: 3
+  - platform: gpio
+    id: sr_q4
+    pin:
+      sn74hc595: sr
+      number: 4
+  - platform: gpio
+    id: sr_q5
+    pin:
+      sn74hc595: sr
+      number: 5
+  - platform: gpio
+    id: sr_q6
+    pin:
+      sn74hc595: sr
+      number: 6
+  - platform: gpio
+    id: sr_q7
+    pin:
+      sn74hc595: sr
+      number: 7
+
+switch:
+  - platform: output
+    name: "50 (ch1)"
+    output: sr_q0
+    id: ch1_prefilter
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: output
+    name: "100 (ch2)"
+    output: sr_q1
+    id: ch2_postfilter
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: output
+    name: "250 (ch3)"
+    output: sr_q2
+    id: ch3_500
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: output
+    name: "500 (ch4)"
+    output: sr_q3
+    id: ch4_250
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: output
+    name: "Postfilter (ch5)"
+    output: sr_q4
+    id: ch5_postfilter
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: output
+    name: "Prefilter (ch6)"
+    output: sr_q5
+    id: ch6_prefilter
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: output
+    name: "Pump (ch7)"
+    output: sr_q6
+    id: ch7_pump
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: output
+    name: "UV (ch8)"
+    output: sr_q7
+    id: ch8_uv
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# Flow meters
+sensor:
+  - platform: pulse_meter
+    pin:
+      number: 18
+      mode: INPUT_PULLUP
+    name: "Flow Tank LPM"
+    id: flow_tank_lpm
+    unit_of_measurement: "L/min"
+    accuracy_decimals: 3
+    timeout: 5s
+    internal_filter: 10us
+    filters:
+      # pulses/min ÷ pulses_per_liter (450) = L/min
+      - multiply: 0.0022222222
+
+  - platform: pulse_meter
+    pin:
+      number: 19
+      mode: INPUT_PULLUP
+    name: "Flow House LPM"
+    id: flow_house_lpm
+    unit_of_measurement: "L/min"
+    accuracy_decimals: 3
+    timeout: 5s
+    internal_filter: 10us
+    filters:
+      - multiply: 0.0022222222
+
+  - platform: template
+    name: "Flow Tank Hz"
+    id: flow_tank_hz
+    unit_of_measurement: "Hz"
+    accuracy_decimals: 3
+    update_interval: 1s
+    lambda: |-
+      if (isnan(id(flow_tank_lpm).state)) return NAN;
+      // Hz = LPM * 7.5 (450 pulses/L ÷ 60)
+      return id(flow_tank_lpm).state * 7.5f;
+
+  - platform: template
+    name: "Flow House Hz"
+    id: flow_house_hz
+    unit_of_measurement: "Hz"
+    accuracy_decimals: 3
+    update_interval: 1s
+    lambda: |-
+      if (isnan(id(flow_house_lpm).state)) return NAN;
+      return id(flow_house_lpm).state * 7.5f;
+
+  # ADC inputs (Vi2=GPIO33, Vi4=GPIO32), board scales by ~5x
+  - platform: adc
+    pin: 33
+    name: "Vi2 Voltage"
+    id: vi2_voltage
+    attenuation: 12db
+    update_interval: 15s
+    filters:
+      - multiply: 5.0
+
+  - platform: template
+    name: "Vi2 PSI"
+    id: vi2_psi
+    unit_of_measurement: "psi"
+    accuracy_decimals: 2
+    update_interval: 15s
+    lambda: |-
+      if (isnan(id(vi2_voltage).state)) return NAN;
+      // Vi2 full-scale 60 psi, SENSOR_FS_VOLTS=5.0
+      return (id(vi2_voltage).state / 5.0f) * 60.0f;
+
+  - platform: adc
+    pin: 32
+    name: "Vi4 Voltage"
+    id: vi4_voltage
+    attenuation: 12db
+    update_interval: 15s
+    filters:
+      - multiply: 5.0
+
+  - platform: template
+    name: "Vi4 PSI"
+    id: vi4_psi
+    unit_of_measurement: "psi"
+    accuracy_decimals: 2
+    update_interval: 15s
+    lambda: |-
+      if (isnan(id(vi4_voltage).state)) return NAN;
+      // Vi4 full-scale 100 psi
+      return (id(vi4_voltage).state / 5.0f) * 100.0f;
+
+binary_sensor:
+  - platform: status
+    name: "${device_name} Status"
+
+# HA-configurable variables (exposed in HA)
+globals:
+  - id: mqtt_host
+    type: std::string
+    initial_value: '"192.168.88.205"'
+  - id: mqtt_port
+    type: int
+    initial_value: '1883'
+  - id: mqtt_user
+    type: std::string
+    initial_value: '"eletechsup"'
+  - id: mqtt_pass
+    type: std::string
+    initial_value: '""'
+  - id: dd_host
+    type: std::string
+    initial_value: '"192.168.88.204"'
+  - id: dd_port
+    type: int
+    initial_value: '8125'
+
+text:
+  - platform: template
+    name: "MQTT Host"
+    id: mqtt_host_text
+    mode: text
+    optimistic: true
+    restore_value: true
+    on_value:
+      then:
+        - lambda: |-
+            id(mqtt_host) = x;
+  - platform: template
+    name: "MQTT Username"
+    id: mqtt_user_text
+    mode: text
+    optimistic: true
+    restore_value: true
+    on_value:
+      then:
+        - lambda: |-
+            id(mqtt_user) = x;
+  - platform: template
+    name: "MQTT Password"
+    id: mqtt_pass_text
+    mode: text
+    optimistic: true
+    restore_value: true
+    on_value:
+      then:
+        - lambda: |-
+            id(mqtt_pass) = x;
+  - platform: template
+    name: "DogStatsD Host"
+    id: dd_host_text
+    mode: text
+    optimistic: true
+    restore_value: true
+    on_value:
+      then:
+        - lambda: |-
+            id(dd_host) = x;
+
+number:
+  - platform: template
+    name: "MQTT Port"
+    id: mqtt_port_num
+    min_value: 1
+    max_value: 65535
+    step: 1
+    mode: box
+    initial_value: 1883
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "port"
+    on_value:
+      then:
+        - lambda: |-
+            id(mqtt_port) = (int)x;
+
+  - platform: template
+    name: "DogStatsD Port"
+    id: dd_port_num
+    min_value: 1
+    max_value: 65535
+    step: 1
+    mode: box
+    initial_value: 8125
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "port"
+    on_value:
+      then:
+        - lambda: |-
+            id(dd_port) = (int)x;
+
+interval:
+  - interval: 15s
+    then:
+      - lambda: |-
+          // Send DogStatsD metrics individually to avoid truncation
+          if (id(dd_host).empty() || id(dd_port) <= 0) return;
+          static WiFiUDP udp;
+          char line[180];
+          auto host = id(dd_host).c_str();
+          int  port = id(dd_port);
+
+          auto send = [&](const char* fmt, float v){
+            int n = snprintf(line, sizeof(line), fmt, v);
+            if (n > 0) { udp.beginPacket(host, port); udp.write((uint8_t*)line, (size_t)n); udp.endPacket(); }
+          };
+
+          // PSI
+          if (!isnan(id(vi2_psi).state)) send("iot.pressure:%0.3f|g|#source:eletechsup,service:water,channel:vi2,location:house,unit:psi\n", id(vi2_psi).state);
+          if (!isnan(id(vi4_psi).state)) send("iot.pressure:%0.3f|g|#source:eletechsup,service:water,channel:vi4,location:postfilter,unit:psi\n", id(vi4_psi).state);
+          // Volts
+          if (!isnan(id(vi2_voltage).state)) send("iot.voltage:%0.3f|g|#source:eletechsup,service:water,channel:vi2,location:house,unit:v\n", id(vi2_voltage).state);
+          if (!isnan(id(vi4_voltage).state)) send("iot.voltage:%0.3f|g|#source:eletechsup,service:water,channel:vi4,location:postfilter,unit:v\n", id(vi4_voltage).state);
+          // Flow
+          if (!isnan(id(flow_tank_lpm).state)) send("iot.flow:%0.3f|g|#source:eletechsup,service:water,channel:tank,unit:lpm\n", id(flow_tank_lpm).state);
+          if (!isnan(id(flow_house_lpm).state)) send("iot.flow:%0.3f|g|#source:eletechsup,service:water,channel:house,unit:lpm\n", id(flow_house_lpm).state);
+          if (!isnan(id(flow_tank_hz).state)) send("iot.flow:%0.3f|g|#source:eletechsup,service:water,channel:tank,unit:hz\n", id(flow_tank_hz).state);
+          if (!isnan(id(flow_house_hz).state)) send("iot.flow:%0.3f|g|#source:eletechsup,service:water,channel:house,unit:hz\n", id(flow_house_hz).state);
+
+status_led:
+  pin:
+    number: 2
+    inverted: true
+

@@ -1,6 +1,6 @@
 # eletechsup-ES32D26 (ESP32 firmware)
 
-Version: 0.2.0
+Version: 1.0.0
 
 Firmware for the Eletechsup 2AO-8AI-8DI-8DO board (ES32D26) using an ESP32-DevKitC.
 
@@ -11,19 +11,22 @@ Firmware for the Eletechsup 2AO-8AI-8DI-8DO board (ES32D26) using an ESP32-DevKi
 - Counts 2 flow meters (IO18=tank, IO19=house) and publishes L/min and Hz
 - Controls a peristaltic pump on channel 7 (relay bit mapped uniquely)
 - Publishes `iot.pressure` as DogStatsD metrics to a Datadog Agent with rich tags
-- Auto safety: after 300s from first MQTT command, turns all relays OFF
 
 ## Channels and relay mapping
 - Relays are driven via 74HC595 -> ULN2803A
 - Shift register pins to ESP32: DATA=GPIO12, SRCLK=GPIO22, LATCH=GPIO23, OE(LOW)=GPIO13
-- Channel tags and topics:
-  - ch1 → `prefilter`   → topic `/eletechsup/prefilter`
-  - ch2 → `postfilter`  → topic `/eletechsup/postfilter`
-  - ch3 → `500`         → topic `/eletechsup/500`
-  - ch4 → `250`         → topic `/eletechsup/250`
-  - ch5 → `100`         → topic `/eletechsup/100`
-  - ch6 → `50`          → topic `/eletechsup/50`
-  - ch7 → `pump`        → topic `/eletechsup/pump`
+- Channel labels (ESPHome):
+  - ch1 → `50`
+  - ch2 → `100`
+  - ch3 → `250`
+  - ch4 → `500`
+  - ch5 → `Postfilter`
+  - ch6 → `Prefilter`
+  - ch7 → `Pump`
+  - ch8 → `UV`
+
+MQTT topics (Arduino firmware):
+  - `/eletechsup/prefilter`, `/eletechsup/postfilter`, `/eletechsup/500`, `/eletechsup/250`, `/eletechsup/100`, `/eletechsup/50`, `/eletechsup/pump`
 
 ## MQTT control (relays)
 
@@ -99,4 +102,19 @@ arduino-cli upload -p /dev/cu.usbserial-0001 --fqbn esp32:esp32:esp32 .
 ## Networking
 - Static IP: 192.168.88.206 (configured in firmware)
 - Hostname: esp32_water (set via WiFi.setHostname)
+
+## ESPHome (alternative firmware)
+- Config file: `esphome/es32d26.yaml`
+- Features:
+  - Relays via SN74HC595 with mapping ch1..ch8 to Q0..Q7
+  - Flow meters: IO18 (tank) and IO19 (house) LPM + derived Hz
+  - Vi2 (GPIO33) and Vi4 (GPIO32) ADC with PSI conversion
+  - OTA + API for Home Assistant
+  - HA-editable settings: MQTT Host/User/Password/Port and DogStatsD Host/Port (ports are integers)
+- Flash:
+  ```bash
+  esphome compile esphome/es32d26.yaml
+  esphome upload esphome/es32d26.yaml --device /dev/cu.usbserial-0001  # first flash
+  esphome upload esphome/es32d26.yaml --device 192.168.88.206          # OTA updates
+  ```
 

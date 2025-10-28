@@ -46,7 +46,7 @@ const char* INPUT_BASE_TOPIC = "/eletechsup/inputs";
 // ch1=prefilter, ch2=postfilter, ch3=500, ch4=250, ch5=100, ch6=50
 
 // ------------ Home Assistant Discovery ------------
-static const char* FW_VERSION = "0.2.0";
+static const char* FW_VERSION = "1.0.0";
 static const char* HA_PREFIX = "homeassistant";
 static const char* DEVICE_ID = "esp32_water";
 static const char* AVAIL_TOPIC = "esp32_water/status";
