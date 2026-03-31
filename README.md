@@ -1,5 +1,7 @@
 # eletechsup-ES32D26 (ESP32 firmware)
 
+Version: 1.0.1
+
 Firmware for the Eletechsup 2AO-8AI-8DI-8DO board (ES32D26) using an ESP32-DevKitC.
 
 ## What it does
@@ -55,3 +57,7 @@ arduino-cli upload -p /dev/cu.usbserial-0001 --fqbn esp32:esp32:esp32 .
 - Ensure the Datadog Agent exposes DogStatsD on UDP 8125 and allows non‑local traffic.
 - Keep credentials out of commits; use placeholders in code or untracked config.
 - ADC pins: Vi1=GPIO14 (ADC2), Vi2=GPIO33 (ADC1), Vi3=GPIO27 (ADC2), Vi4=GPIO32 (ADC1)
+
+## ESPHome (v1.0.1)
+- Config: `esphome/es32d26.yaml`
+- Removed `fast_connect: true` — fixes intermittent WiFi failure (Probe Request Unsuccessful) after AP restart or channel change; device now performs a full scan on reconnect
