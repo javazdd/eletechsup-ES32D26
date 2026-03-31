@@ -56,7 +56,6 @@ arduino-cli upload -p /dev/cu.usbserial-0001 --fqbn esp32:esp32:esp32 .
 ## Notes
 - Ensure the Datadog Agent exposes DogStatsD on UDP 8125 and allows non‑local traffic.
 - Keep credentials out of commits; use placeholders in code or untracked config.
-- ADC pins: Vi1=GPIO14 (ADC2), Vi2=GPIO33 (ADC1), Vi3=GPIO27 (ADC2), Vi4=GPIO32 (ADC1)
 
 ## ESPHome (v1.0.1)
 - Config: `esphome/es32d26.yaml`
